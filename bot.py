@@ -16,10 +16,10 @@ import psycopg2
 import psycopg2.pool
 
 # ============= CONFIG =============
-BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN      = os.environ.get("BOT_TOKEN", "8390444092:AAG0e-hqZbbkPs5snI5regEeLpSjA_ChuA4")
 OWNER_ID       = int(os.environ.get("OWNER_ID", "8128821116"))
 ADMIN_IDS      = [OWNER_ID]
-DATABASE_URL   = os.environ.get("DATABASE_URL", "")
+DATABASE_URL   = os.environ.get("DATABASE_URL", "postgresql://postgres:rolex-hosting-panel@db.bkuwfzcfyxwasxccabzs.supabase.co:5432/postgres")
 
 BOMB_DURATION_PER_CREDIT = 300
 DAILY_FREE_CREDITS       = 5
